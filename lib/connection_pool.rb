@@ -53,46 +53,57 @@ class ConnectionPool
     @key = :"current-#{@available.object_id}"
   end
 
-if Thread.respond_to?(:handle_interrupt)
+  if Thread.respond_to?(:handle_interrupt)
 
-  # MRI
-  def with(options = {})
-    Thread.handle_interrupt(Exception => :never) do
+    # MRI
+    def with(options = {})
+      Thread.handle_interrupt(Exception => :never) do
+        conn = checkout(options)
+        begin
+          Thread.handle_interrupt(Exception => :immediate) do
+            yield conn
+          end
+        ensure
+          checkin
+        end
+      end
+    end
+
+  else
+
+    # jruby 1.7.x
+    def with(options = {})
       conn = checkout(options)
       begin
-        Thread.handle_interrupt(Exception => :immediate) do
-          yield conn
-        end
+        yield conn
       ensure
         checkin
       end
     end
+
   end
-
-else
-
-  # jruby 1.7.x
-  def with(options = {})
-    conn = checkout(options)
-    begin
-      yield conn
-    ensure
-      checkin
-    end
-  end
-
-end
 
   def checkout(options = {})
-    conn = if stack.empty?
-      timeout = options[:timeout] || @timeout
-      @available.pop(timeout: timeout)
-    else
-      stack.last
+
+    tries = 3
+    while tries>0 do
+
+      conn = if stack.empty?
+               timeout = options[:timeout] || @timeout
+               @available.pop(timeout: timeout)
+             else
+               stack.last
+             end
+
+      if test_connection conn
+        stack.push conn
+        return conn
+      end
+      tries -= 1
     end
 
-    stack.push conn
-    conn
+    raise ConnectionPool::Error, 'no connections are available'
+
   end
 
   def checkin
@@ -104,6 +115,14 @@ end
 
   def shutdown(&block)
     @available.shutdown(&block)
+  end
+
+  def test_connection(connection)
+    @test_block.call connection
+  end
+
+  def set_test_connection(&block)
+    @test_block = block
   end
 
   private
@@ -121,7 +140,7 @@ end
   end
 
   class Wrapper < ::BasicObject
-    METHODS = [:with, :pool_shutdown]
+    METHODS = [:with, :pool_shutdown, :set_test]
 
     def initialize(options = {}, &block)
       @pool = options.fetch(:pool) { ::ConnectionPool.new(options, &block) }
@@ -133,6 +152,10 @@ end
 
     def pool_shutdown(&block)
       @pool.shutdown(&block)
+    end
+
+    def set_test(&block)
+      @pool.set_test_connection(&block)
     end
 
     def respond_to?(id, *args)
